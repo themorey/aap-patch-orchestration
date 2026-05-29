@@ -1,0 +1,185 @@
+- name: Post-Patch Validation for Windows Systems
+  hosts: windows
+  gather_facts: yes
+  vars:
+    validation_report_path: "C:\\Temp\\post-patch-validation-{{ ansible_date_time.epoch }}.json"
+    required_services:
+      - wuauserv
+      - BITS
+      - CryptSvc
+
+  tasks:
+    - name: Wait for system to stabilize after reboot
+      wait_for_connection:
+        timeout: 600
+        delay: 30
+
+    - name: Gather fresh facts after potential reboot
+      setup:
+
+    - name: Check system uptime
+      win_shell: |
+        $os = Get-CimInstance Win32_OperatingSystem
+        $uptime = (Get-Date) - $os.LastBootUpTime
+        [PSCustomObject]@{
+          UptimeMinutes = [math]::Round($uptime.TotalMinutes, 0)
+          LastBootTime = $os.LastBootUpTime
+        } | ConvertTo-Json -Compress
+      register: uptime_info
+
+    - name: Parse uptime information
+      set_fact:
+        uptime_data: "{{ uptime_info.stdout | from_json }}"
+
+    - name: Determine if system was rebooted
+      set_fact:
+        system_rebooted: "{{ uptime_data.UptimeMinutes | int < 60 }}"
+
+    - name: Check if reboot is still pending
+      win_shell: |
+        $rebootPending = $false
+        if (Test-Path "HKLM:\Software\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending") {
+          $rebootPending = $true
+        }
+        if (Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired") {
+          $rebootPending = $true
+        }
+        Write-Output $rebootPending
+      register: reboot_still_pending
+
+    - name: Check Windows Update service status
+      win_service_info:
+        name: "{{ required_services }}"
+      register: service_info
+
+    - name: Validate required services
+      assert:
+        that:
+          - item.state == 'running' or item.start_mode == 'auto'
+        fail_msg: "Service {{ item.name }} is not running after patch"
+        success_msg: "Service {{ item.name }} is running"
+      loop: "{{ service_info.services }}"
+
+    - name: Check Windows Event Log for errors (last hour)
+      win_shell: |
+        $StartTime = (Get-Date).AddHours(-1)
+        $Errors = Get-WinEvent -FilterHashtable @{
+          LogName='System','Application'
+          Level=2
+          StartTime=$StartTime
+        } -ErrorAction SilentlyContinue
+        if ($Errors) {
+          $Errors.Count
+        } else {
+          0
+        }
+      register: event_errors
+
+    - name: Get recent Windows Update history
+      win_shell: |
+        $Session = New-Object -ComObject Microsoft.Update.Session
+        $Searcher = $Session.CreateUpdateSearcher()
+        $HistoryCount = $Searcher.GetTotalHistoryCount()
+        if ($HistoryCount -gt 0) {
+          $History = $Searcher.QueryHistory(0, [Math]::Min($HistoryCount, 10))
+          $RecentUpdates = $History | Where-Object { $_.Date -gt (Get-Date).AddHours(-24) } | 
+            Select-Object Title, Date, @{Name='Result';Expression={
+              switch ($_.ResultCode) {
+                1 { "In Progress" }
+                2 { "Succeeded" }
+                3 { "Succeeded with errors" }
+                4 { "Failed" }
+                5 { "Aborted" }
+                default { "Unknown" }
+              }
+            }}
+          $RecentUpdates | ConvertTo-Json -Compress
+        } else {
+          '[]'
+        }
+      register: recent_updates
+
+    - name: Check for available updates (should be minimal)
+      win_shell: |
+        $UpdateSession = New-Object -ComObject Microsoft.Update.Session
+        $UpdateSearcher = $UpdateSession.CreateUpdateSearcher()
+        $SearchResult = $UpdateSearcher.Search("IsInstalled=0 and IsHidden=0")
+        $SearchResult.Updates.Count
+      register: remaining_updates
+
+    - name: Check disk space on C drive
+      win_shell: |
+        $disk = Get-PSDrive -Name C
+        [math]::Round($disk.Free / 1GB, 2)
+      register: post_patch_disk_space
+
+    - name: Get memory usage
+      win_shell: |
+        $os = Get-CimInstance Win32_OperatingSystem
+        $used = $os.TotalVisibleMemorySize - $os.FreePhysicalMemory
+        [math]::Round(($used / $os.TotalVisibleMemorySize) * 100, 0)
+      register: memory_usage
+
+    - name: Test critical application (example: IIS)
+      win_shell: |
+        if (Get-Service W3SVC -ErrorAction SilentlyContinue) {
+          $service = Get-Service W3SVC
+          $service.Status
+        } else {
+          "NotInstalled"
+        }
+      register: iis_status
+
+    - name: Check Windows Defender status
+      win_shell: |
+        $Defender = Get-MpComputerStatus
+        @{
+          AntivirusEnabled = $Defender.AntivirusEnabled
+          RealTimeProtectionEnabled = $Defender.RealTimeProtectionEnabled
+          DefinitionUpdated = $Defender.AntivirusSignatureLastUpdated
+        } | ConvertTo-Json -Compress
+      register: defender_status
+      ignore_errors: yes
+
+    - name: Create post-patch validation report
+      win_copy:
+        content: |
+          {
+            "hostname": "{{ inventory_hostname }}",
+            "timestamp": "{{ ansible_date_time.iso8601 }}",
+            "uptime_minutes": {{ uptime_data.UptimeMinutes }},
+            "last_boot_time": "{{ uptime_data.LastBootTime }}",
+            "system_rebooted": {{ system_rebooted | to_json }},
+            "reboot_still_pending": {{ reboot_still_pending.stdout | trim | lower }},
+            "remaining_updates": {{ remaining_updates.stdout | trim }},
+            "disk_space_gb": {{ post_patch_disk_space.stdout | trim }},
+            "memory_usage_percent": {{ memory_usage.stdout | trim }},
+            "event_errors_last_hour": {{ event_errors.stdout | trim }},
+            "recent_updates": {{ recent_updates.stdout | default('[]') }},
+            "validation_status": "{{ 'PASSED' if not (reboot_still_pending.stdout | trim | bool) else 'REBOOT_REQUIRED' }}"
+          }
+        dest: "{{ validation_report_path }}"
+
+    - name: Fetch post-patch validation report
+      fetch:
+        src: "{{ validation_report_path }}"
+        dest: "./reports/post-patch/{{ inventory_hostname }}-post-patch-{{ ansible_date_time.date }}.json"
+        flat: yes
+
+    - name: Display post-patch validation summary
+      debug:
+        msg: |
+          ========================================
+          Post-Patch Validation Summary
+          ========================================
+          Hostname: {{ inventory_hostname }}
+          Uptime: {{ uptime_data.UptimeMinutes }} minutes
+          Last Boot: {{ uptime_data.LastBootTime }}
+          Rebooted: {{ system_rebooted }}
+          Reboot Pending: {{ reboot_still_pending.stdout | trim }}
+          Remaining Updates: {{ remaining_updates.stdout | trim }}
+          Disk Space: {{ post_patch_disk_space.stdout | trim }}GB
+          Memory Usage: {{ memory_usage.stdout | trim }}%
+          Event Errors (1hr): {{ event_errors.stdout | trim }}
+          Status: {{ 'PASSED' if not (reboot_still_pending.stdout | trim | bool) else 'REBOOT_REQUIRED' }}
+          ========================================
