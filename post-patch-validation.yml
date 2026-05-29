@@ -1,0 +1,150 @@
+- name: Post-Patch Validation for Linux Systems
+  hosts: linux
+  gather_facts: yes
+  vars:
+    validation_report_path: "/tmp/post-patch-validation-{{ ansible_date_time.epoch }}.json"
+    required_services:
+      - sshd
+      - systemd-resolved
+      - rsyslog
+
+  tasks:
+    - name: Wait for system to stabilize after reboot
+      wait_for_connection:
+        timeout: 300
+        delay: 10
+
+    - name: Gather fresh facts after potential reboot
+      setup:
+
+    - name: Check system uptime (verify if rebooted)
+      shell: cat /proc/uptime | awk '{print int($1/60)}'
+      register: uptime_minutes
+      changed_when: false
+
+    - name: Determine if system was rebooted
+      set_fact:
+        system_rebooted: "{{ uptime_minutes.stdout | int < 30 }}"
+
+    - name: Get kernel version
+      command: uname -r
+      register: kernel_version
+      changed_when: false
+
+    - name: Verify critical services are running
+      service_facts:
+
+    - name: Validate required services
+      assert:
+        that:
+          - ansible_facts.services[item + '.service'].state == 'running'
+        fail_msg: "Service {{ item }} is not running after patch"
+        success_msg: "Service {{ item }} is running"
+      loop: "{{ required_services }}"
+
+    - name: Check for failed systemd units
+      shell: systemctl --failed | grep -c failed || echo 0
+      register: failed_units
+      changed_when: false
+
+    - name: Get list of failed units
+      shell: systemctl --failed --no-pager
+      register: failed_units_list
+      when: failed_units.stdout | int > 0
+      changed_when: false
+
+    - name: Check application connectivity (example: web server)
+      uri:
+        url: "http://localhost:80"
+        status_code: [200, 301, 302]
+      register: web_check
+      failed_when: false
+      when: "'apache2' in ansible_facts.services or 'httpd' in ansible_facts.services"
+
+    - name: Verify package manager is working
+      shell: |
+        if command -v apt &> /dev/null; then
+          apt update && echo "OK"
+        elif command -v dnf &> /dev/null; then
+          dnf check-update && echo "OK" || echo "OK"
+        else
+          yum check-update && echo "OK" || echo "OK"
+        fi
+      register: package_manager_check
+      changed_when: false
+
+    - name: Check for remaining updates
+      shell: |
+        if command -v apt &> /dev/null; then
+          apt list --upgradable 2>/dev/null | grep -v Listing | wc -l
+        elif command -v dnf &> /dev/null; then
+          dnf check-update --quiet | wc -l
+        else
+          yum check-update --quiet | wc -l
+        fi
+      register: remaining_updates
+      changed_when: false
+
+    - name: Check disk space after patching
+      shell: df -BG / | tail -1 | awk '{print $4}' | sed 's/G//'
+      register: post_patch_disk_space
+      changed_when: false
+
+    - name: Get memory usage
+      shell: free -m | grep Mem | awk '{print int($3/$2*100)}'
+      register: memory_usage
+      changed_when: false
+
+    - name: Check system logs for errors (last 100 lines)
+      shell: journalctl -p err -n 100 --no-pager | wc -l
+      register: error_log_count
+      changed_when: false
+
+    - name: Create post-patch validation report
+      copy:
+        content: |
+          {
+            "hostname": "{{ inventory_hostname }}",
+            "timestamp": "{{ ansible_date_time.iso8601 }}",
+            "kernel_version": "{{ kernel_version.stdout }}",
+            "uptime_minutes": {{ uptime_minutes.stdout }},
+            "system_rebooted": {{ system_rebooted | to_json }},
+            "failed_systemd_units": {{ failed_units.stdout }},
+            "remaining_updates": {{ remaining_updates.stdout }},
+            "disk_space_gb": {{ post_patch_disk_space.stdout }},
+            "memory_usage_percent": {{ memory_usage.stdout }},
+            "error_log_entries": {{ error_log_count.stdout }},
+            "validation_status": "{{ 'PASSED' if failed_units.stdout | int == 0 else 'WARNING' }}"
+          }
+        dest: "{{ validation_report_path }}"
+
+    - name: Fetch post-patch validation report
+      fetch:
+        src: "{{ validation_report_path }}"
+        dest: "./reports/post-patch/{{ inventory_hostname }}-post-patch-{{ ansible_date_time.date }}.json"
+        flat: yes
+
+    - name: Display post-patch validation summary
+      debug:
+        msg: |
+          ========================================
+          Post-Patch Validation Summary
+          ========================================
+          Hostname: {{ inventory_hostname }}
+          Kernel: {{ kernel_version.stdout }}
+          Uptime: {{ uptime_minutes.stdout }} minutes
+          Rebooted: {{ system_rebooted }}
+          Failed Units: {{ failed_units.stdout }}
+          Remaining Updates: {{ remaining_updates.stdout }}
+          Disk Space: {{ post_patch_disk_space.stdout }}GB
+          Memory Usage: {{ memory_usage.stdout }}%
+          Error Logs: {{ error_log_count.stdout }} entries
+          Status: {{ 'PASSED' if failed_units.stdout | int == 0 else 'WARNING - Check failed units' }}
+          ========================================
+
+    - name: Warn if failed units detected
+      debug:
+        msg: |
+          WARNING: Failed systemd units detected!
+          {{ failed_units_list.stdout }}
+      when: failed_units.stdout | int > 0
