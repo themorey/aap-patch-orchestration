@@ -2,7 +2,7 @@
   hosts: linux
   gather_facts: yes
   vars:
-    min_disk_space_gb: 5
+    min_disk_space_gb: 2
     required_services:
       - sshd
       - systemd-resolved
