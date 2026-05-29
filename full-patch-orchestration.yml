@@ -1,0 +1,107 @@
+- name: Complete Patch Orchestration Workflow
+  hosts: all
+  gather_facts: no
+  vars:
+    workflow_id: "{{ ansible_date_time.epoch }}"
+    enable_snapshot: false  # Set to true to create VM snapshots before patching
+    
+  tasks:
+    - name: Create workflow directory
+      file:
+        path: "./reports/workflow-{{ workflow_id }}"
+        state: directory
+      delegate_to: localhost
+      run_once: true
+
+    - name: Log workflow start
+      copy:
+        content: |
+          Patch Orchestration Workflow Started
+          =====================================
+          Workflow ID: {{ workflow_id }}
+          Start Time: {{ ansible_date_time.iso8601 }}
+          Target Hosts: {{ ansible_play_hosts | join(', ') }}
+        dest: "./reports/workflow-{{ workflow_id }}/00-workflow-start.txt"
+      delegate_to: localhost
+      run_once: true
+
+# Phase 1: Pre-Patch Validation
+- name: Phase 1 - Pre-Patch Validation (Linux)
+  import_playbook: pre-patch-validation.yml
+  vars:
+    phase: "pre-patch"
+
+- name: Phase 1 - Pre-Patch Validation (Windows)
+  import_playbook: pre-patch-validation-windows.yml
+  vars:
+    phase: "pre-patch"
+
+# Phase 2: Create Snapshots (Optional)
+- name: Phase 2 - Create VM Snapshots
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - name: Create Azure VM snapshots
+      include_tasks: create-snapshots.yml
+      when: enable_snapshot | bool
+
+# Phase 3: Patch Installation
+- name: Phase 3 - Trigger Patching
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - name: Choose patching method
+      debug:
+        msg: "Select patching method: azure_update_manager or mecm"
+
+    - name: Trigger Azure Update Manager
+      import_playbook: trigger-azure-update-manager.yml
+      when: patch_method == "azure_update_manager"
+
+    - name: Trigger MECM Deployment
+      import_playbook: trigger-mecm-deployment.yml
+      when: patch_method == "mecm"
+
+# Phase 4: Wait for Patching to Complete
+- name: Phase 4 - Wait for Patching
+  hosts: all
+  gather_facts: no
+  tasks:
+    - name: Wait for systems to come back online
+      wait_for_connection:
+        timeout: 1800  # 30 minutes
+        delay: 60
+
+# Phase 5: Post-Patch Validation
+- name: Phase 5 - Post-Patch Validation (Linux)
+  import_playbook: post-patch-validation.yml
+  vars:
+    phase: "post-patch"
+
+- name: Phase 5 - Post-Patch Validation (Windows)
+  import_playbook: post-patch-validation-windows.yml
+  vars:
+    phase: "post-patch"
+
+# Phase 6: Generate Final Report
+- name: Phase 6 - Generate Workflow Report
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - name: Compile workflow results
+      shell: |
+        cat ./reports/workflow-{{ workflow_id }}/*.txt > ./reports/workflow-{{ workflow_id }}/FINAL-REPORT.txt
+        echo "" >> ./reports/workflow-{{ workflow_id }}/FINAL-REPORT.txt
+        echo "Workflow Completed: $(date)" >> ./reports/workflow-{{ workflow_id }}/FINAL-REPORT.txt
+      args:
+        executable: /bin/bash
+
+    - name: Display workflow completion
+      debug:
+        msg: |
+          ========================================
+          Patch Orchestration Workflow Complete
+          ========================================
+          Workflow ID: {{ workflow_id }}
+          Report Location: ./reports/workflow-{{ workflow_id }}/FINAL-REPORT.txt
+          ========================================
