@@ -1,0 +1,20 @@
+---
+- name: Pre-Patch Validation
+  hosts: all
+  gather_facts: yes
+  tasks:
+    - name: Check system uptime
+      command: uptime
+      register: uptime_result
+
+    - name: Check disk space
+      shell: df -h
+      register: disk_result
+
+    - name: Upload validation results to Azure Storage
+      azure_rm_storageblob:
+        resource_group: "{{ lookup('env', 'RG') }}"
+        storage_account_name: "{{ lookup('env', 'STORAGE_ACCOUNT') }}"
+        container: patch-artifacts
+        blob: "pre-patch/{{ inventory_hostname }}-{{ ansible_date_time.iso8601 }}.json"
+        content: "{{ {'uptime': uptime_result.stdout, 'disk': disk_result.stdout} | to_json }}"
