@@ -1,19 +1,138 @@
-- name: Pre-Patch Validation
-  hosts: all
+- name: Pre-Patch Validation for Linux Systems
+  hosts: linux
   gather_facts: yes
+  vars:
+    min_disk_space_gb: 5
+    required_services:
+      - sshd
+      - systemd-resolved
+      - rsyslog
+    validation_report_path: "/tmp/pre-patch-validation-{{ ansible_date_time.epoch }}.json"
+
   tasks:
-    - name: Check system uptime
-      command: uptime
-      register: uptime_result
+    - name: Check disk space on root partition
+      shell: df -BG / | tail -1 | awk '{print $4}' | sed 's/G//'
+      register: root_disk_space
+      changed_when: false
 
-    - name: Check disk space
-      shell: df -h
-      register: disk_result
+    - name: Validate minimum disk space
+      assert:
+        that:
+          - root_disk_space.stdout | int >= min_disk_space_gb
+        fail_msg: "Insufficient disk space: {{ root_disk_space.stdout }}GB available, {{ min_disk_space_gb }}GB required"
+        success_msg: "Disk space check passed: {{ root_disk_space.stdout }}GB available"
 
-    - name: Upload validation results to Azure Storage
-      azure_rm_storageblob:
-        resource_group: "{{ lookup('env', 'RG') }}"
-        storage_account_name: "{{ lookup('env', 'STORAGE_ACCOUNT') }}"
-        container: patch-artifacts
-        blob: "pre-patch/{{ inventory_hostname }}-{{ ansible_date_time.iso8601 }}.json"
-        content: "{{ {'uptime': uptime_result.stdout, 'disk': disk_result.stdout} | to_json }}"
+    - name: Check system load average
+      shell: uptime | awk -F'load average:' '{print $2}' | awk -F, '{print $1}' | xargs
+      register: load_average
+      changed_when: false
+
+    - name: Get memory usage
+      shell: free -m | grep Mem | awk '{print int($3/$2*100)}'
+      register: memory_usage
+      changed_when: false
+
+    - name: Check if system requires reboot
+      stat:
+        path: /var/run/reboot-required
+      register: reboot_required
+      when: ansible_os_family == "Debian"
+
+    - name: Verify critical services are running
+      service_facts:
+
+    - name: Validate required services
+      assert:
+        that:
+          - ansible_facts.services[item + '.service'].state == 'running'
+        fail_msg: "Service {{ item }} is not running"
+        success_msg: "Service {{ item }} is running"
+      loop: "{{ required_services }}"
+      when: ansible_os_family == "Debian" or ansible_os_family == "RedHat"
+
+    - name: Check for existing package manager locks
+      shell: |
+        if [ -f /var/lib/dpkg/lock ]; then
+          fuser /var/lib/dpkg/lock 2>/dev/null && echo "locked" || echo "unlocked"
+        else
+          echo "unlocked"
+        fi
+      register: dpkg_lock
+      changed_when: false
+      when: ansible_os_family == "Debian"
+
+    - name: Check yum/dnf locks
+      shell: |
+        if [ -f /var/run/yum.pid ]; then
+          echo "locked"
+        else
+          echo "unlocked"
+        fi
+      register: yum_lock
+      changed_when: false
+      when: ansible_os_family == "RedHat"
+
+    - name: List available updates
+      shell: |
+        if command -v apt &> /dev/null; then
+          apt list --upgradable 2>/dev/null | grep -v Listing | wc -l
+        elif command -v dnf &> /dev/null; then
+          dnf check-update --quiet | wc -l
+        else
+          yum check-update --quiet | wc -l
+        fi
+      register: available_updates
+      changed_when: false
+
+    - name: Check kernel version
+      command: uname -r
+      register: kernel_version
+      changed_when: false
+
+    - name: Get system uptime
+      command: uptime -p
+      register: system_uptime
+      changed_when: false
+
+    - name: Create validation report
+      copy:
+        content: |
+          {
+            "hostname": "{{ inventory_hostname }}",
+            "timestamp": "{{ ansible_date_time.iso8601 }}",
+            "os_family": "{{ ansible_os_family }}",
+            "os_version": "{{ ansible_distribution }} {{ ansible_distribution_version }}",
+            "kernel": "{{ kernel_version.stdout }}",
+            "uptime": "{{ system_uptime.stdout }}",
+            "disk_space_gb": {{ root_disk_space.stdout }},
+            "memory_usage_percent": {{ memory_usage.stdout }},
+            "load_average": "{{ load_average.stdout }}",
+            "available_updates": {{ available_updates.stdout }},
+            "reboot_required": {{ reboot_required.stat.exists | default(false) | to_json }},
+            "validation_status": "PASSED"
+          }
+        dest: "{{ validation_report_path }}"
+
+    - name: Fetch validation report
+      fetch:
+        src: "{{ validation_report_path }}"
+        dest: "./reports/pre-patch/{{ inventory_hostname }}-pre-patch-{{ ansible_date_time.date }}.json"
+        flat: yes
+
+    - name: Display validation summary
+      debug:
+        msg: |
+          ========================================
+          Pre-Patch Validation Summary
+          ========================================
+          Hostname: {{ inventory_hostname }}
+          OS: {{ ansible_distribution }} {{ ansible_distribution_version }}
+          Kernel: {{ kernel_version.stdout }}
+          Uptime: {{ system_uptime.stdout }}
+          Disk Space: {{ root_disk_space.stdout }}GB available
+          Memory Usage: {{ memory_usage.stdout }}%
+          Load Average: {{ load_average.stdout }}
+          Available Updates: {{ available_updates.stdout }}
+          Reboot Required: {{ reboot_required.stat.exists | default(false) }}
+          Status: READY FOR PATCHING
+          ========================================
