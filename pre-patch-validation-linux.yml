@@ -5,8 +5,7 @@
     min_disk_space_gb: 2
     required_services:
       - sshd
-      - systemd-resolved
-      - rsyslog
+
     validation_report_path: "/tmp/pre-patch-validation-{{ ansible_date_time.epoch }}.json"
 
   tasks:
