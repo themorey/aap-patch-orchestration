@@ -1,0 +1,101 @@
+- name: Trigger Azure Update Manager Patching
+  hosts: localhost
+  gather_facts: no
+  vars:
+    azure_subscription_id: "{{ lookup('env', 'AZURE_SUBSCRIPTION_ID') }}"
+    resource_group: "{{ lookup('env', 'AZURE_RESOURCE_GROUP') | default('jm-patchdemo-rg', true) }}"
+    vm_names: "{{ target_vms.split(',') }}"  # Pass as extra var: --extra-vars "target_vms=vm1,vm2"
+    maximum_duration: "PT2H"  # ISO 8601 duration format
+    reboot_setting: "IfRequired"  # Options: IfRequired, Never, Always
+    
+  tasks:
+    - name: Validate required variables
+      assert:
+        that:
+          - azure_subscription_id is defined
+          - resource_group is defined
+          - vm_names is defined
+        fail_msg: "Required variables not set. Ensure AZURE_SUBSCRIPTION_ID, AZURE_RESOURCE_GROUP, and target_vms are defined."
+
+    - name: Trigger patch assessment for each VM
+      azure.azcollection.azure_rm_resource:
+        api_version: '2023-04-01'
+        resource_group: "{{ resource_group }}"
+        provider: Compute
+        resource_type: virtualMachines
+        resource_name: "{{ item }}"
+        subresource:
+          - type: assessPatches
+        method: POST
+      loop: "{{ vm_names }}"
+      register: assessment_results
+      ignore_errors: yes
+
+    - name: Display assessment status
+      debug:
+        msg: "Assessment triggered for {{ item.item }}: {{ item.response.status | default('Failed') }}"
+      loop: "{{ assessment_results.results }}"
+
+    - name: Wait for assessments to complete
+      pause:
+        seconds: 90
+        prompt: "Waiting for patch assessments to complete..."
+
+    - name: Trigger patch installation for each VM
+      azure.azcollection.azure_rm_resource:
+        api_version: '2023-04-01'
+        resource_group: "{{ resource_group }}"
+        provider: Compute
+        resource_type: virtualMachines
+        resource_name: "{{ item }}"
+        subresource:
+          - type: installPatches
+        method: POST
+        body:
+          maximumDuration: "{{ maximum_duration }}"
+          rebootSetting: "{{ reboot_setting }}"
+          windowsParameters:
+            classificationsToInclude:
+              - Critical
+              - Security
+              - UpdateRollup
+              - ServicePack
+            kbNumbersToInclude: []
+            kbNumbersToExclude: []
+          linuxParameters:
+            classificationsToInclude:
+              - Critical
+              - Security
+            packageNameMasksToInclude: []
+            packageNameMasksToExclude: []
+      loop: "{{ vm_names }}"
+      register: install_results
+
+    - name: Create installation report
+      copy:
+        content: |
+          Azure Update Manager - Patch Installation Report
+          =================================================
+          Timestamp: {{ ansible_date_time.iso8601 }}
+          Resource Group: {{ resource_group }}
+          Maximum Duration: {{ maximum_duration }}
+          Reboot Setting: {{ reboot_setting }}
+          
+          Installation Results:
+          {% for result in install_results.results %}
+          - VM: {{ result.item }}
+            Status: {{ result.response.properties.provisioningState | default('Unknown') }}
+            Operation ID: {{ result.response.name | default('N/A') }}
+          {% endfor %}
+        dest: "./reports/patch-installation/azure-update-manager-{{ ansible_date_time.epoch }}.txt"
+      delegate_to: localhost
+
+    - name: Display installation summary
+      debug:
+        msg: |
+          ========================================
+          Azure Update Manager - Installation Summary
+          ========================================
+          VMs Patched: {{ vm_names | length }}
+          Report: ./reports/patch-installation/azure-update-manager-{{ ansible_date_time.epoch }}.txt
+          ========================================
