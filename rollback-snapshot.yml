@@ -1,0 +1,57 @@
+- name: Emergency Rollback from Snapshot
+  hosts: localhost
+  gather_facts: no
+  vars:
+    resource_group: "{{ lookup('env', 'AZURE_RESOURCE_GROUP') }}"
+    vm_name: "{{ target_vm }}"  # Pass as extra var
+    snapshot_name: "{{ vm_name }}-pre-patch-{{ snapshot_date }}"  # Pass as extra var
+
+  tasks:
+    - name: Confirm rollback
+      pause:
+        prompt: |
+          ⚠️  WARNING: Rolling back VM {{ vm_name }} from snapshot {{ snapshot_name }}
+          This will DESTROY all changes made since the snapshot was created.
+          Type 'yes' to continue, or Ctrl+C to abort
+
+    - name: Stop VM
+      azure.azcollection.azure_rm_virtualmachine:
+        resource_group: "{{ resource_group }}"
+        name: "{{ vm_name }}"
+        allocated: false
+
+    - name: Get VM OS disk
+      azure.azcollection.azure_rm_manageddisk_info:
+        resource_group: "{{ resource_group }}"
+        name: "{{ vm_name }}-osdisk"
+      register: os_disk
+
+    - name: Restore disk from snapshot
+      azure.azcollection.azure_rm_manageddisk:
+        resource_group: "{{ resource_group }}"
+        name: "{{ vm_name }}-osdisk-restored"
+        create_option: Copy
+        source_uri: "/subscriptions/{{ lookup('env', 'AZURE_SUBSCRIPTION_ID') }}/resourceGroups/{{ resource_group }}/providers/Microsoft.Compute/snapshots/{{ snapshot_name }}"
+        disk_size_gb: "{{ os_disk.ansible_info.azure_managed_disk[0].disk_size_gb }}"
+
+    - name: Swap OS disk
+      azure.azcollection.azure_rm_virtualmachine:
+        resource_group: "{{ resource_group }}"
+        name: "{{ vm_name }}"
+        storage_account_name: null
+        os_disk_name: "{{ vm_name }}-osdisk-restored"
+
+    - name: Start VM
+      azure.azcollection.azure_rm_virtualmachine:
+        resource_group: "{{ resource_group }}"
+        name: "{{ vm_name }}"
+        allocated: true
+
+    - name: Wait for VM to be accessible
+      wait_for_connection:
+        timeout: 300
+        delay: 30
+
+    - name: Verify rollback
+      debug:
+        msg: "VM {{ vm_name }} successfully rolled back to snapshot {{ snapshot_name }}"
