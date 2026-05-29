@@ -1,4 +1,3 @@
----
 - name: Pre-Patch Validation
   hosts: all
   gather_facts: yes
