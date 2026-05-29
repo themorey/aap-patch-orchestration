@@ -1,0 +1,144 @@
+- name: Pre-Patch Validation for Windows Systems
+  hosts: windows
+  gather_facts: yes
+  vars:
+    min_disk_space_gb: 10
+    required_services:
+      - wuauserv
+      - BITS
+      - CryptSvc
+    validation_report_path: "C:\\Temp\\pre-patch-validation-{{ ansible_date_time.epoch }}.json"
+
+  tasks:
+    - name: Ensure temp directory exists
+      win_file:
+        path: C:\Temp
+        state: directory
+
+    - name: Check disk space on C drive
+      win_shell: |
+        $disk = Get-PSDrive -Name C
+        [math]::Round($disk.Free / 1GB, 2)
+      register: c_disk_space
+
+    - name: Validate minimum disk space
+      assert:
+        that:
+          - c_disk_space.stdout | trim | float >= min_disk_space_gb
+        fail_msg: "Insufficient disk space: {{ c_disk_space.stdout | trim }}GB available, {{ min_disk_space_gb }}GB required"
+        success_msg: "Disk space check passed: {{ c_disk_space.stdout | trim }}GB available"
+
+    - name: Check Windows Update service status
+      win_service_info:
+        name: "{{ required_services }}"
+      register: service_info
+
+    - name: Validate required services
+      assert:
+        that:
+          - item.state == 'running' or item.start_mode == 'auto'
+        fail_msg: "Service {{ item.name }} is not running or not set to automatic"
+        success_msg: "Service {{ item.name }} is properly configured"
+      loop: "{{ service_info.services }}"
+
+    - name: Check if reboot is pending
+      win_shell: |
+        $rebootPending = $false
+        
+        # Check Component Based Servicing
+        if (Test-Path "HKLM:\Software\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending") {
+          $rebootPending = $true
+        }
+        
+        # Check Windows Update
+        if (Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired") {
+          $rebootPending = $true
+        }
+        
+        # Check PendingFileRenameOperations
+        $pfro = Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager" -Name PendingFileRenameOperations -ErrorAction SilentlyContinue
+        if ($pfro) {
+          $rebootPending = $true
+        }
+        
+        Write-Output $rebootPending
+      register: reboot_pending
+
+    - name: Get Windows Update history
+      win_shell: |
+        $Session = New-Object -ComObject Microsoft.Update.Session
+        $Searcher = $Session.CreateUpdateSearcher()
+        $HistoryCount = $Searcher.GetTotalHistoryCount()
+        if ($HistoryCount -gt 0) {
+          $History = $Searcher.QueryHistory(0, [Math]::Min($HistoryCount, 10))
+          $History | Select-Object -First 5 Title, Date | ConvertTo-Json -Compress
+        } else {
+          '[]'
+        }
+      register: update_history
+
+    - name: Check available updates
+      win_shell: |
+        $UpdateSession = New-Object -ComObject Microsoft.Update.Session
+        $UpdateSearcher = $UpdateSession.CreateUpdateSearcher()
+        $SearchResult = $UpdateSearcher.Search("IsInstalled=0 and IsHidden=0")
+        $SearchResult.Updates.Count
+      register: available_updates
+
+    - name: Get system information
+      win_shell: |
+        @{
+          ComputerName = $env:COMPUTERNAME
+          OSVersion = (Get-CimInstance Win32_OperatingSystem).Version
+          OSBuild = (Get-CimInstance Win32_OperatingSystem).BuildNumber
+          LastBootTime = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
+          TotalMemoryGB = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 2)
+          FreeMemoryGB = [math]::Round((Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory / 1MB, 2)
+        } | ConvertTo-Json -Compress
+      register: system_info
+
+    - name: Parse system information
+      set_fact:
+        sys_info: "{{ system_info.stdout | from_json }}"
+
+    - name: Create validation report
+      win_copy:
+        content: |
+          {
+            "hostname": "{{ inventory_hostname }}",
+            "timestamp": "{{ ansible_date_time.iso8601 }}",
+            "computer_name": "{{ sys_info.ComputerName }}",
+            "os_version": "{{ sys_info.OSVersion }}",
+            "os_build": "{{ sys_info.OSBuild }}",
+            "last_boot_time": "{{ sys_info.LastBootTime }}",
+            "disk_space_gb": {{ c_disk_space.stdout | trim }},
+            "total_memory_gb": {{ sys_info.TotalMemoryGB }},
+            "free_memory_gb": {{ sys_info.FreeMemoryGB }},
+            "available_updates": {{ available_updates.stdout | trim }},
+            "reboot_pending": {{ reboot_pending.stdout | trim | lower }},
+            "validation_status": "PASSED"
+          }
+        dest: "{{ validation_report_path }}"
+
+    - name: Fetch validation report
+      fetch:
+        src: "{{ validation_report_path }}"
+        dest: "./reports/pre-patch/{{ inventory_hostname }}-pre-patch-{{ ansible_date_time.date }}.json"
+        flat: yes
+
+    - name: Display validation summary
+      debug:
+        msg: |
+          ========================================
+          Pre-Patch Validation Summary
+          ========================================
+          Hostname: {{ inventory_hostname }}
+          Computer Name: {{ sys_info.ComputerName }}
+          OS Version: {{ sys_info.OSVersion }}
+          Build: {{ sys_info.OSBuild }}
+          Disk Space: {{ c_disk_space.stdout | trim }}GB available
+          Memory: {{ sys_info.FreeMemoryGB }}GB free / {{ sys_info.TotalMemoryGB }}GB total
+          Available Updates: {{ available_updates.stdout | trim }}
+          Reboot Pending: {{ reboot_pending.stdout | trim }}
+          Status: READY FOR PATCHING
+          ========================================
